@@ -1,30 +1,54 @@
 import ffmpeg
 import pandas as pd
 import datetime as dt
+import subprocess
 import os
+
+
+def _parse_creation_time(creation_time: str) -> float:
+    """
+    Parse an ISO-8601 creation_time string from ffmpeg metadata into a Unix timestamp.
+
+    Handles both formats written by cameras and phones:
+      - With fractional seconds:  "2025-03-25T14:03:00.123456Z"
+      - Without fractional seconds: "2025-03-25T14:03:00Z"
+
+    Raises ValueError if neither format matches.
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return dt.datetime.strptime(creation_time, fmt).timestamp()
+        except ValueError:
+            continue
+    raise ValueError(
+        f"creation_time '{creation_time}' does not match any known ISO-8601 format. "
+        "Expected 'YYYY-MM-DDTHH:MM:SS[.ffffff]+HH:MM' or 'YYYY-MM-DDTHH:MM:SSZ'."
+    )
+
 
 def compare_video_eeg(video_path: str, csv_path: str, video_duration: float) -> tuple[float, float]:
     """
-        Compares EEG data's timecode with that of the video.
+    Compares EEG data's timecode with that of the video.
 
-        Returns the new start and end time of the video to match it with the EEG.
+    Returns the new start and end time (in seconds) to cut the video so that
+    it covers exactly the same real-world time window as the EEG recording.
 
-        Note that for this to work, the video should have accurate timecode.
+    Note that for this to work, the video should have accurate creation_time metadata.
 
-        Arguments:
-        - video_path (str): Path to the video.
-        - eeg_path (str): Path to the CSV file that contains EEG data.
-        - video_duration (float): Duration of the video in seconds.
+    Arguments:
+    - video_path (str): Path to the video.
+    - csv_path (str): Path to the CSV file that contains EEG data (muselsl format,
+                      must have a 'timestamps' column of Unix epoch floats).
+    - video_duration (float): Duration of the video in seconds.
 
-        Returns:
-        - start_time (float): New start time of the video.
-        - end_time (float): New end time of the video.
-
-        TODO Implement matching the last timecode of the EEG with the video.
+    Returns:
+    - start_time (float): New start time of the video (seconds from video start).
+    - end_time (float): New end time of the video (seconds from video start).
     """
 
-    # Extract video creation time
-    # Note that the metadata might change depending on the camera.
+    # ── Extract video creation time ───────────────────────────────────────────
+    # Note: metadata tag location varies by camera/encoder; check streams first,
+    # then the format container.
     video_metadata = ffmpeg.probe(video_path)
     creation_time = None
     for stream in video_metadata.get("streams", []):
@@ -37,94 +61,94 @@ def compare_video_eeg(video_path: str, csv_path: str, video_duration: float) -> 
     if not creation_time:
         raise ValueError("No creation_time found in video metadata")
 
-    # Convert datetime into timestamp.
-    video_creation_dt = dt.datetime.strptime(creation_time, "%Y-%m-%dT%H:%M:%S.%f%z")
-    video_creation_timestamp = video_creation_dt.timestamp()
+    # FIX: use robust parser that handles both .ffffff and no-fractional-seconds forms
+    video_creation_timestamp = _parse_creation_time(creation_time)
 
-    # Read the CSV
+    # ── Read EEG CSV ──────────────────────────────────────────────────────────
     df = pd.read_csv(csv_path)
+    if "timestamps" not in df.columns:
+        raise ValueError(f"EEG CSV '{csv_path}' has no 'timestamps' column.")
 
-    # Extract initial timestamp from the CSV
-    initial_csv_timestamp = df["timestamps"][0]
-    last_csv_timestamp = df["timestamps"].iloc[-1]
-        
-    # Calculate the adjustment needed
+    initial_csv_timestamp = float(df["timestamps"].iloc[0])
+    last_csv_timestamp    = float(df["timestamps"].iloc[-1])
+
+    # Duration of the EEG recording itself
+    eeg_duration = last_csv_timestamp - initial_csv_timestamp
+
+    # time_difference > 0 → EEG started BEFORE the video
+    # time_difference < 0 → EEG started AFTER the video (rare, but handled)
     time_difference = initial_csv_timestamp - video_creation_timestamp
 
-    # EEG data is the last thing that will start before session starts.
-    # Therefore 99% of the time the above calculation will be a positive value.
-
-    # The new length of the video
-    # We will add it to start time to find the end time
-    new_duration = last_csv_timestamp - initial_csv_timestamp
-
-    if time_difference > 0:
-        # Video starts later than CSV
-        start_time = abs(time_difference)
-        end_time = start_time + new_duration
+    if time_difference >= 0:
+        # ── Common case: EEG was already running when the camera started ──────
+        # The EEG has |time_difference| seconds of data before the video begins.
+        # We seek the video to t=0 (its natural start) and run for eeg_duration,
+        # clamped to the actual video length.
+        start_time = 0.0
+        end_time   = min(eeg_duration, video_duration)
     else:
-        # Note: This does not really make sense,
-        # Someone should check it out.
-        # Video starts earlier or at the same time as CSV
-        start_time = 0
-        end_time = video_duration - abs(time_difference)
+        # ── EEG started after the camera ──────────────────────────────────────
+        # |time_difference| seconds of video elapsed before EEG began.
+        # Seek the video forward to the point the EEG started, then run for
+        # eeg_duration, clamped so we never exceed the video's end.
+        start_time = abs(time_difference)
+        end_time   = min(start_time + eeg_duration, video_duration)
 
     return (start_time, end_time)
 
-def cut_video_from_start_end(video_path: str, start_time: float, end_time: float, temp_output_path: str) -> str:
+
+def cut_video_from_start_end(video_path: str, start_time: float, end_time: float, temp_output_path: str) -> None:
     """
-        Opens a FFMPEG subprocess and cuts the video provided
-        so that it starts at start_time seconds and ends at end_time.
+    Cuts the video so that it starts at start_time seconds and ends at end_time.
 
-        This function will check if the file already exists in the folder and remove it if necessary.
+    Removes the output file first if it already exists (ffmpeg refuses to overwrite
+    by default, and the -y flag is not always reliable across platforms).
 
-        Opens a pipe to get updates from the FFMPEG subprocess and prints it to standard output.
+    Blocks until ffmpeg finishes.
 
-        This function blocks until FFMPEG subprocess is done.
-
-        Arguments:
-        - video_path (str): Path to the video
-        - start_time (float): When to start the video, in seconds
-        - end_time (float): When to end the video, in seconds
-
-        
-        TODO Check initially if start and end times are valid.
-        TODO Better temp file handling
+    Arguments:
+    - video_path (str): Path to the source video.
+    - start_time (float): Start point in seconds (must be >= 0).
+    - end_time (float): End point in seconds (must be > start_time).
     """
+    # ── Validate times ────────────────────────────────────────────────────────
+    if start_time < 0:
+        raise ValueError(f"start_time must be >= 0, got {start_time:.3f}")
+    if end_time <= start_time:
+        raise ValueError(
+            f"end_time ({end_time:.3f}) must be greater than start_time ({start_time:.3f})"
+        )
 
-
-    # current_time = dt.datetime.now().strftime("%d%m%Y%H%M%S")
-    # temp_file_name = f"temporary_{current_time}"
+    # ── Remove stale output if present ───────────────────────────────────────
+    if os.path.exists(temp_output_path):
+        os.remove(temp_output_path)
 
     eeg_sync_video = ffmpeg.input(video_path, ss=start_time, to=end_time)
-    out = ffmpeg.output(eeg_sync_video, temp_output_path, vcodec="copy", acodec="copy").compile()
-    import subprocess
-    import datetime # For printing progress
-    import os
+    out_cmd = ffmpeg.output(eeg_sync_video, temp_output_path, vcodec="copy", acodec="copy").compile()
 
-    # Run the FFMPEG subprocess
+    end_time_str = str(dt.timedelta(seconds=end_time))
+
+    print("FFMPEG is starting, please wait.")
     try:
-        ffmpeg_process = subprocess.Popen(out, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        ffmpeg_process = subprocess.Popen(
+            out_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+        )
     except OSError:
-        print("OSError")
+        print("OSError: could not launch ffmpeg.")
         return
-    except ValueError:
-        print("ValueError: Cannot run FFMPEG with given parameters.")
+    except ValueError as exc:
+        print(f"ValueError: Cannot run FFMPEG with given parameters. {exc}")
         return
 
-    end_time = str(datetime.timedelta(seconds=end_time)) # Used for printing the last point of the video
-    # Print the progress that ffmpeg outputs
-    print("FFMPEG is starting, please wait a couple minutes.")
     for line in ffmpeg_process.stdout:
-        # for all output from ffmpeg
-        print(line)
+        print(line, end="")
+        for elem in line.split(" "):
+            if elem.startswith("time="):
+                progress = elem.split("=")[1].strip()
+                print(f"Progress: currently at {progress} / going until {end_time_str}", end="\r")
 
-        # If you would like to print it in a simpler format
-        # This shows how much of the video you processed
-        all_info = line.split(" ") 
-        for elem in all_info:
-            if elem.startswith("time"):
-                progress = elem.split("=")[1]
-                print(f"Progress: currently at {progress} / going until {end_time}", end="\r")
-
-    print("FFMPEG has finished processing.")
+    ffmpeg_process.wait()
+    print("\nFFMPEG has finished processing.")

@@ -1,5 +1,12 @@
 from pathlib import Path
 import sys
+import tempfile
+import os
+import datetime as _dt
+
+import numpy as _np
+import vlc
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
@@ -9,24 +16,27 @@ from PyQt6.QtWidgets import (
     QGroupBox, QProgressBar, QStatusBar, QToolBar,
     QSpacerItem, QMessageBox
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QPixmap, QPainter
 
 from sync_engine import SyncWorker, SyncResult
-import tempfile, os, datetime as _dt, numpy as _np
-from pathlib import Path
-from PyQt6.QtCore import QThread, pyqtSignal as _sig
-
-from sync_utils.audio_analysis import find_all_delays_with_pivot, find_all_durations
-from sync_utils.video_sync import generate_single_preview, run_ffmpeg_subprocess
+from sync_utils.audio_analysis import compute_delays, find_all_durations
+from sync_utils.video_sync import generate_single_preview, get_first_frame_pts, run_ffmpeg_subprocess
 from sync_utils.eeg_video_sync import compare_video_eeg, cut_video_from_start_end
 from eeg_module import EEGLiveWidget, EEGReviewWidget
 from rtmp_module import RTMPConfigPanel
-import vlc
-import sys
 from vlc_module import VLCVideoSlot, SyncPlaybackController
 from export_module import FullSessionExportWorker, LabelsExporter, ExportProgressDialog
 from labels_config import LABELS as PREDEFINED_LABELS, next_colour, save as save_labels
+
+# ── UI safety helpers ─────────────────────────────────────────────────────────
+_INT32_MAX = 2_147_483_647
+
+def _clamp_ms(ms) -> int:
+    """Clamp a millisecond value to Qt's int32 slider range."""
+    return int(max(0, min(int(ms), _INT32_MAX)))
+
+
 
 # ─── Stylesheet ───────────────────────────────────────────────────────────────
 
@@ -38,8 +48,10 @@ QMainWindow, QWidget {
 }
 
 QTabWidget::pane {
-    border: 1px solid #2a2d35;
+    border: none;
+    border-top: 1px solid #2a2d35;
     background-color: #0e0f11;
+    top: 0px;
 }
 
 QTabWidget::tab-bar {
@@ -711,8 +723,6 @@ class SourceRow(QWidget):
         )
 
 
-import vlc
-import sys
 import pandas as pd
 
 
@@ -743,67 +753,64 @@ class MainEditorSyncWorker(QThread):
 
     def run(self):
         try:
-            video_paths = list(self.video_paths)  # mutable copy — may be replaced for EEG pivot
+            original_video_paths = list(self.video_paths)
 
+            # ── Step 1: Durations ─────────────────────────────────────────────────────
             self.progress.emit(5, "Analyzing durations...")
-            durations = find_all_durations(video_paths)
+            durations = find_all_durations(original_video_paths)
 
-            # Pick pivot — longest video, same as MainEditor.py
-            if self.pivot_index is None:
-                pivot = int(_np.argmax(durations))
-            else:
-                pivot = self.pivot_index
-
-            # ── Step 1: EEG-to-video sync (mirrors MainEditor.py auto_sync EEG block) ──
-            # If EEG files supplied, trim the pivot video to match the EEG window first.
+            # ── Step 2: EEG window offset (stored for display, does NOT trim video) ───
             if self.eeg_paths:
-                self.progress.emit(10, "EEG data detected — syncing pivot video with EEG...")
-                csv_file = self.eeg_paths[0]   # use first EEG file, same as MainEditor.py
+                self.progress.emit(10, "EEG data detected — computing EEG window offset...")
                 try:
-                    start_time, end_time = compare_video_eeg(
-                        video_paths[pivot], csv_file, durations[pivot]
+                    pivot = int(_np.argmax(durations))
+                    eeg_start, eeg_end = compare_video_eeg(
+                        original_video_paths[pivot], self.eeg_paths[0], durations[pivot]
                     )
-                    ts = _dt.datetime.now().strftime('%d%m%Y%H%M%S')
-                    eeg_temp = os.path.join(self._temp_dir.name, f"eeg_sync_{ts}.mp4")
-                    self.progress.emit(15, f"Trimming pivot video to EEG window ({start_time:.1f}s → {end_time:.1f}s)...")
-                    cut_video_from_start_end(video_paths[pivot], start_time, end_time, eeg_temp)
-                    video_paths[pivot] = eeg_temp
-                    durations[pivot]   = end_time - start_time
+                    self.progress.emit(15,
+                        f"EEG window: {eeg_start:.1f}s → {eeg_end:.1f}s in pivot video")
+                    print(f"[EEG sync] pivot video EEG window: {eeg_start:.3f}s → {eeg_end:.3f}s")
                 except Exception as e:
-                    self.progress.emit(15, f"EEG sync skipped: {e}")
+                    self.progress.emit(15, f"EEG offset skipped: {e}")
                     print(f"[EEG sync warning] {e}")
 
-            # ── Step 2: Audio cross-correlation — find delays ──────────────────────────
-            self.progress.emit(20, "Finding delays via audio cross-correlation...")
-            delays = find_all_delays_with_pivot(video_paths, pivot)
-            max_delay = max(delays)
+            # ── Step 3: Audio xcorr delays ────────────────────────────────────────────
+            # Extracts first 5 min at 8 kHz, bandpass+envelope+normalised xcorr.
+            # Completes in < 15s for 4 clips. No ffmpeg encoding at all.
+            self.progress.emit(20, "Computing inter-camera delays via audio xcorr...")
+            raw_delays = compute_delays(original_video_paths)
 
-            # ── Step 3: Generate FFmpeg command per video ──────────────────────────────
-            temp_paths = [None] * len(video_paths)
-            commands   = []
-            new_durs   = list(durations)
+            # Normalise so minimum delay = 0 (earliest clip is the reference).
+            min_delay      = min(raw_delays)
+            norm_delays    = [d - min_delay for d in raw_delays]
+            max_norm_delay = max(norm_delays)
+            print(f"Normalised delays: {[round(d,3) for d in norm_delays]}  "
+                  f"(max={max_norm_delay:.3f}s)")
 
-            for i, path in enumerate(video_paths):
-                pct = 30 + int((i / len(video_paths)) * 25)
-                self.progress.emit(pct, f"Generating FFmpeg command for video {i+1}/{len(video_paths)}...")
-                ts   = _dt.datetime.now().strftime('%d%m%Y%H%M%S')
-                name = f"temporary_vid_{ts}_{i}.mp4"
-                out  = os.path.join(self._temp_dir.name, name)
-                cmd, new_dur = generate_single_preview(
-                    path, delays[i], durations[i], out, max_delay
-                )
-                temp_paths[i] = out
-                commands.append(cmd)
-                new_durs[i]   = new_dur
-
-            # ── Step 4: Run FFmpeg for each video ─────────────────────────────────────
-            for i, cmd in enumerate(commands):
-                pct = 55 + int((i / len(commands)) * 40)
-                self.progress.emit(pct, f"Processing video {i+1}/{len(commands)}...")
-                run_ffmpeg_subprocess(cmd, new_durs[i], debug=False)
+            # ── Step 4: Compute per-clip VLC seek offsets ─────────────────────────────
+            # No ffmpeg encoding needed. We load the ORIGINAL files into VLC and
+            # seek each player to its start offset. VLC's internal seeking is
+            # frame-accurate and instant — no keyframe-snapping issue.
+            #
+            # seek_ms[i] = how far into clip i VLC must seek to reach the shared
+            #              sync point (= the moment all cameras were recording).
+            # The latest-starting clip (max delay) gets seek=0 (starts at its t=0).
+            # All other clips seek forward to the point the latest clip began.
+            self.progress.emit(90, "Computing VLC seek offsets...")
+            seek_ms = [_clamp_ms((max_norm_delay - d) * 1000) for d in norm_delays]
+            for i, (path, s) in enumerate(zip(original_video_paths, seek_ms)):
+                import os as _os
+                print(f"  clip {i} ({_os.path.basename(path)}): "
+                      f"delay={norm_delays[i]:.3f}s  seek={s}ms")
 
             self.progress.emit(100, "Sync complete.")
-            self.finished.emit(temp_paths, delays)
+            # Emit original paths (no temp files) + norm_delays + seek_ms encoded
+            # in the delays list for _on_sync_finished to unpack.
+            # Format: norm_delays[0..n-1] + [max_norm_delay sentinel] + seek_ms[0..n-1]
+            self.finished.emit(
+                original_video_paths,
+                norm_delays + [max_norm_delay] + [float(s) for s in seek_ms]
+            )
 
         except Exception as e:
             self.error.emit(str(e))
@@ -834,6 +841,9 @@ class SyncReviewTab(QWidget):
 
         self.sync_result = None
         self._worker     = None
+        self._temp_paths   = []
+        self._delays       = []   # normalised per-clip delays (set after sync completes)
+        self._residuals_ms = []   # keyframe lead-in per clip in ms (set after sync completes)
         self._post_sync_offsets_ms = [0, 0, 0, 0]
 
         self._pos_timer = QTimer(self)
@@ -953,7 +963,6 @@ class SyncReviewTab(QWidget):
         # ── RIGHT: vertical scroll area containing video grid + EEG ───────────
         # Using QScrollArea so videos get a proper fixed height and EEG sits
         # below — user scrolls vertically to see both.
-        right_scroll = QScrollArea()
         # ── Right side: QScrollArea (full width, scrollable vertically) ──────────
         # video_area auto-sizes to 16:9 cells via resizeEvent — no black bars.
         # VLC NSView stays at screen position when scrolled (macOS limitation)
@@ -1001,15 +1010,26 @@ class SyncReviewTab(QWidget):
         vgrid.setColumnStretch(1, 1)
 
         def _make_video_slot(cam_label, placeholder_text):
+            # Layout: outer QWidget (slot) -> header QWidget (26px) +
+            #                                 vlc_container QWidget (WA_NativeWindow, expands)
+            # The WA_NativeWindow widget is a SIBLING of the header in the
+            # slot layout, but the header comes FIRST — on macOS the NSView
+            # of vlc_container is clipped to its own geometry so it cannot
+            # paint over the header above it as long as the header's geometry
+            # does not overlap the container's geometry.
+            # We also call raise_() on the header after every resize to keep
+            # the Qt compositor stack correct.
+            HEADER_H = 26
+
             slot = QWidget()
             slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             slot_layout = QVBoxLayout(slot)
             slot_layout.setContentsMargins(0, 0, 0, 0)
             slot_layout.setSpacing(0)
 
-            # Header — matches EEG header style
+            # ── Header bar (pure Qt, no native view) ──────────────────────────
             hdr = QWidget()
-            hdr.setFixedHeight(26)
+            hdr.setFixedHeight(HEADER_H)
             hdr.setStyleSheet("background-color: #0e0f11; border-bottom: 1px solid #2a2d35;")
             hdr_layout = QHBoxLayout(hdr)
             hdr_layout.setContentsMargins(8, 0, 8, 0)
@@ -1031,16 +1051,18 @@ class SyncReviewTab(QWidget):
             hdr_layout.addStretch()
             slot_layout.addWidget(hdr)
 
-            # VLC render frame — added directly to layout so winId() is valid
-            frame = QFrame()
-            frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            frame.setStyleSheet("background-color: #0a0b0d; border: none;")
-            frame.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-            slot_layout.addWidget(frame, 1)
+            # ── VLC container (native view lives here, below the header) ──────
+            vlc_container = QWidget()
+            vlc_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            vlc_container.setStyleSheet("background-color: #0a0b0d;")
+            # WA_NativeWindow is set lazily in _load_video_vlc() — setting it
+            # here during layout construction causes the NSView to be placed at
+            # window coordinates (0,0) before Qt has finished the layout pass,
+            # making it appear over the tab bar / header on macOS.
+            slot_layout.addWidget(vlc_container, 1)
 
-            # Placeholder label shown as child of frame before file loads
-            ph = QLabel(placeholder_text)
-            ph.setParent(frame)
+            # Placeholder centred inside vlc_container
+            ph = QLabel(placeholder_text, vlc_container)
             ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
             ph.setStyleSheet(
                 "color: #3a3d48; font-size: 10px; font-family: 'Courier New';"
@@ -1049,15 +1071,20 @@ class SyncReviewTab(QWidget):
             ph.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             ph.show()
 
-            # Resize placeholder to fill frame when frame resizes
-            def _resize_ph(event, _ph=ph, _frame=frame):
-                _ph.setGeometry(0, 0, _frame.width(), _frame.height())
-            frame.resizeEvent = _resize_ph
+            def _resize_container(event, _ph=ph, _c=vlc_container):
+                _ph.setGeometry(0, 0, _c.width(), _c.height())
+            vlc_container.resizeEvent = _resize_container
+
+            # After every resize, raise header above NSView in Qt stack
+            def _resize_slot(event, _hdr=hdr, _slot=slot):
+                _hdr.raise_()
+            slot.resizeEvent = _resize_slot
 
             slot._dot = dot
             slot._status = status_lbl
             slot._ph = ph
-            return slot, frame
+            slot._vlc_container = vlc_container
+            return slot, vlc_container
 
         slot1, self.video_display_1 = _make_video_slot(
             "DSLR  01", "[ DSLR 01  —  UPLOAD VIDEO TO VIEW ]")
@@ -1176,8 +1203,13 @@ class SyncReviewTab(QWidget):
         player = vlc.MediaPlayer()
         self.media_players[i] = player
 
-        # Get native window handle — needs WA_NativeWindow set on the frame
-        win_id = int(self.video_widgets[i].winId())
+        # Set WA_NativeWindow now (deferred from build time).
+        # The widget is fully laid out at this point so the NSView is
+        # created at the correct screen position, not at (0,0).
+        widget = self.video_widgets[i]
+        widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        widget.winId()  # force handle creation before reading it
+        win_id = int(widget.winId())
 
         # Platform-specific handle — mirrors MainEditor.py set_hwnd()
         if sys.platform == "darwin":
@@ -1267,19 +1299,18 @@ class SyncReviewTab(QWidget):
             # in the tightest possible burst to minimise inter-player drift.
             active = [p for p in self.media_players if p]
 
-            # Step 1 — pause + seek all to same position
-            ref_time = 0
+            # content_floor_ms = largest per-clip seek offset (ms).
+            # Play/resume never seeks before this point.
+            seek_targets = getattr(self, "_residuals_ms", [])  # reused field
+            content_floor_ms = _clamp_ms(max(seek_targets)) if seek_targets else 0
+
+            # Each player is at its own file position (its individual seek offset).
+            # After sync they are already aligned — just play them all in a tight
+            # burst without re-seeking, which would break the per-clip offsets.
             for p in active:
                 p.pause()
-                t = p.get_time()
-                if t > 0:
-                    ref_time = t
-                    break
 
-            for p in active:
-                p.set_time(ref_time)
-
-            # Step 2 — start all in one tight burst (no other work between calls)
+            # Start all in one tight burst
             for p in active:
                 p.play()
 
@@ -1289,9 +1320,21 @@ class SyncReviewTab(QWidget):
     # ── Scrub — mirrors MainEditor.py set_position() ─────────────────────────
 
     def _set_position(self, position_ms):
-        for p in self.media_players:
+        # position_ms is the slider value = file position of the reference player
+        # (the latest-starting clip, which has seek_ms = max_seek = slider_minimum).
+        # Each other player[i] needs: position_ms - max_seek + seek_ms[i]
+        seek_targets = getattr(self, "_residuals_ms", [])
+        max_seek = max(seek_targets) if seek_targets else 0
+
+        for i, p in enumerate(self.media_players):
             if p:
-                p.set_time(position_ms)
+                if seek_targets and i < len(seek_targets):
+                    # Convert global slider position to this player's file position
+                    player_pos = position_ms - max_seek + seek_targets[i]
+                    p.set_time(_clamp_ms(player_pos))
+                else:
+                    p.set_time(_clamp_ms(position_ms))
+
         self._update_tc(position_ms)
         self.eeg_review_1.set_playhead(position_ms / 1000.0)
         self.eeg_review_2.set_playhead(position_ms / 1000.0)
@@ -1302,7 +1345,7 @@ class SyncReviewTab(QWidget):
         if self.sync_result is not None:
             return
         self.time_slider.blockSignals(True)
-        self.time_slider.setValue(ms)
+        self.time_slider.setValue(_clamp_ms(ms))
         self.time_slider.blockSignals(False)
         self._update_tc(ms)
 
@@ -1310,7 +1353,7 @@ class SyncReviewTab(QWidget):
         if self.sync_result is not None:
             return
         if ms > 0:
-            self.time_slider.setRange(0, ms)
+            self.time_slider.setRange(0, _clamp_ms(ms))
             secs = ms / 1000.0
             h = int(secs // 3600)
             m = int((secs % 3600) // 60)
@@ -1319,17 +1362,25 @@ class SyncReviewTab(QWidget):
 
     def _poll_position(self):
         """100ms timer — drives slider, timecode and EEG playhead from VLC."""
-        for p in self.media_players:
+        seek_targets = getattr(self, "_residuals_ms", [])
+        max_seek     = max(seek_targets) if seek_targets else 0
+
+        for i, p in enumerate(self.media_players):
             if p:
                 t = p.get_time()
                 if t < 0:
                     continue
+                # Convert player file position to global timeline position.
+                # Each player sits at file_pos = global_t + seek_ms[i] - max_seek
+                # So: global_t = file_pos - seek_ms[i] + max_seek
+                my_seek = seek_targets[i] if seek_targets and i < len(seek_targets) else 0
+                global_t = _clamp_ms(t - my_seek + max_seek)
                 self.time_slider.blockSignals(True)
-                self.time_slider.setValue(t)
+                self.time_slider.setValue(global_t)
                 self.time_slider.blockSignals(False)
-                self._update_tc(t)
-                self.eeg_review_1.set_playhead(t / 1000.0)
-                self.eeg_review_2.set_playhead(t / 1000.0)
+                self._update_tc(global_t)
+                self.eeg_review_1.set_playhead(global_t / 1000.0)
+                self.eeg_review_2.set_playhead(global_t / 1000.0)
                 break
 
     def _update_tc(self, ms):
@@ -1366,67 +1417,152 @@ class SyncReviewTab(QWidget):
         self.sync_progress.setValue(pct)
         self._set_sync_status(msg.upper(), "#e8ff00")
 
-    def _on_sync_finished(self, temp_paths, delays):
+    def _on_sync_finished(self, video_paths, delays_with_sentinel):
         """
-        Mirrors MainEditor.py auto_sync() final step exactly:
+        Called when MainEditorSyncWorker completes.
 
-            new_medias = [QMediaContent(QUrl.fromLocalFile(path))
-                          for path in self.temp_video_paths]
-            for index, player in enumerate(self.media_players):
-                player.setMedia(new_medias[index])
+        delays_with_sentinel format:
+          [norm_delay_0, ..., norm_delay_n-1,   <- per-clip normalised delays
+           max_norm_delay,                       <- sentinel: shared sync offset
+           seek_ms_0, ..., seek_ms_n-1]         <- per-clip VLC seek targets (ms)
 
-        Except we use VLC and file URIs.
-        Each temp file already starts at the correct aligned frame —
-        playing from t=0 gives perfect sync with no seeking required.
+        video_paths are the ORIGINAL source files (no temp files created).
+        Each VLC player loads its original file and seeks to seek_ms[i] to
+        reach the shared sync point — frame-accurate, instant, no re-encode.
         """
         self.sync_progress.setValue(100)
-        self._temp_paths = temp_paths  # keep reference so temp dir stays alive
-        self._delays     = delays
 
+        n_clips        = len(video_paths)
+        delays         = list(delays_with_sentinel[:n_clips])
+        max_norm_delay = float(delays_with_sentinel[n_clips]) if len(delays_with_sentinel) > n_clips else 0.0
+        seek_ms_list   = [
+            int(delays_with_sentinel[n_clips + 1 + i])
+            if len(delays_with_sentinel) > n_clips + 1 + i else 0
+            for i in range(n_clips)
+        ]
+
+        self._temp_paths   = video_paths   # original files — no temp dir needed
+        self._delays       = delays
+        self._residuals_ms = seek_ms_list  # reuse field: per-clip VLC seek targets
+
+        # ── Build SyncResult ──────────────────────────────────────────────────
+        from sync_engine import SourceOffset, SyncResult as _SR
         video_sources = [s for s in self.sources[:4] if s.file_path]
+        video_offsets = []
+        for i, src in enumerate(video_sources):
+            d = delays[i] if i < len(delays) else 0.0
+            video_offsets.append(SourceOffset(
+                source_id=f"VIDEO_{i+1:02d}",
+                path=src.file_path,
+                offset_sec=d,
+                is_reference=(d == 0.0),
+                method="xcorr",
+                confidence=1.0,
+            ))
+        eeg_sources = [s for s in self.sources[4:] if s.file_path]
+        eeg_offsets = [
+            SourceOffset(
+                source_id=f"EEG_{i+1:02d}",
+                path=s.file_path,
+                offset_sec=0.0,
+                method="creation_time",
+                confidence=0.95,
+            )
+            for i, s in enumerate(eeg_sources)
+        ]
 
-        # Reload each VLC player with its temp (aligned) file.
-        # Play briefly then pause to pre-buffer — ensures first play()
-        # call on each player is fast and they start in tight sync.
-        for i, path in enumerate(temp_paths):
+        # Global duration = shortest content window across all clips
+        global_duration = 0.0
+        for i, path in enumerate(video_paths):
+            if path and os.path.exists(path):
+                try:
+                    import ffmpeg as _ffmpeg
+                    probe = _ffmpeg.probe(path)
+                    d = float(probe["format"].get("duration", 0.0))
+                    seek_s = seek_ms_list[i] / 1000.0 if i < len(seek_ms_list) else 0.0
+                    content_dur = max(d - seek_s, 0.0)
+                    global_duration = content_dur if global_duration == 0.0 else min(global_duration, content_dur)
+                except Exception:
+                    pass
+        self.sync_result = _SR(
+            global_duration=max(global_duration, 0.0),
+            video_offsets=video_offsets,
+            eeg_offsets=eeg_offsets,
+        )
+
+        # ── Load original files into VLC and seek to sync offset ────────────
+        # Key insight: set_time() must be called AFTER play() has been called
+        # once (so VLC opens the file) but the timing matters.
+        # We use a polling approach: check every 100ms until VLC reports a
+        # valid duration (meaning the file is fully opened), then seek+pause.
+        target_seeks = [_clamp_ms(s) for s in seek_ms_list]
+
+        for i, path in enumerate(video_paths):
             if i < len(self.media_players) and self.media_players[i] and path:
                 media = vlc.Media(Path(path).as_uri())
                 self.media_players[i].set_media(media)
-                # pre-buffer: play then immediately pause
+                # Start playing so VLC opens the file and buffers
                 self.media_players[i].play()
 
-        # Give VLC 800ms to open and buffer all files, then pause all at t=0
-        def _prebuffer_done():
-            for p in self.media_players:
+        # Poll until all players report a valid duration, then seek+pause.
+        # Timeout after 10 seconds to avoid hanging if a file fails to open.
+        _poll_count = [0]
+        _max_polls  = 100   # 100 * 100ms = 10 seconds max
+
+        def _wait_and_seek():
+            _poll_count[0] += 1
+            active = [p for p in self.media_players if p]
+
+            # Check if all active players have a known duration (file is open)
+            all_ready = all(p.get_length() > 0 for p in active)
+
+            if not all_ready and _poll_count[0] < _max_polls:
+                QTimer.singleShot(100, _wait_and_seek)
+                return
+
+            if not all_ready:
+                print("[Sync] Warning: some players did not report duration in time")
+
+            # All open — pause and seek each to its sync point
+            for i, p in enumerate(self.media_players):
                 if p:
                     p.pause()
-                    p.set_time(0)
-            # Set slider range from the first player that reports a duration
+                    seek = target_seeks[i] if i < len(target_seeks) else 0
+                    p.set_time(seek)
+                    print(f"  player {i}: set_time({seek}ms)")
+
+            # Build slider range over the shared content window
+            max_seek_ms    = max(target_seeks) if target_seeks else 0
+            content_end_ms = 0
             for p in self.media_players:
                 if p:
-                    dur_ms = p.get_length()
-                    if dur_ms > 0:
-                        self.time_slider.setRange(0, dur_ms)
-                        h = int(dur_ms / 1000 // 3600)
-                        m = int((dur_ms / 1000 % 3600) // 60)
-                        s = (dur_ms / 1000) % 60
-                        self.duration_label.setText(f"{h:02d}:{m:02d}:{s:05.2f}")
+                    total_ms = p.get_length()
+                    if total_ms > 0:
+                        content_end_ms = total_ms
                         break
 
-        QTimer.singleShot(800, _prebuffer_done)
+            if content_end_ms > max_seek_ms:
+                self.time_slider.setRange(_clamp_ms(max_seek_ms), _clamp_ms(content_end_ms))
+                self.time_slider.setValue(_clamp_ms(max_seek_ms))
+                secs = (content_end_ms - max_seek_ms) / 1000.0
+                h = int(secs // 3600)
+                m = int((secs % 3600) // 60)
+                s = secs % 60
+                self.duration_label.setText(f"{h:02d}:{m:02d}:{s:05.2f}")
+            else:
+                self.time_slider.setRange(0, 0)
 
-        # Reset slider to raw ms range — temp files all start at t=0
+        QTimer.singleShot(200, _wait_and_seek)
+
         self.time_slider.setRange(0, 0)
         self.time_slider.setValue(0)
         self.play_btn.setText("▶  PLAY")
         self.play_btn.setEnabled(True)
-        self._post_sync_offsets_ms = [0] * 4  # no offsets needed — files are aligned
+        self._post_sync_offsets_ms = [0] * 4
 
-        # Update offset labels on source rows
         for i, (src_row, delay) in enumerate(zip(self.sources[:4], delays)):
             src_row.set_offset(delay)
 
-        # Load EEG into review widgets at offset=0 (already aligned by MainEditorSyncWorker)
         eeg_sources = [s for s in self.sources[4:] if s.file_path]
         for i, widget in enumerate([self.eeg_review_1, self.eeg_review_2]):
             if i < len(eeg_sources):
@@ -1439,8 +1575,7 @@ class SyncReviewTab(QWidget):
         self._set_sync_status("SYNC COMPLETE  ✓", "#22c55e")
         self.sync_btn.setEnabled(True)
         self.goto_label_btn.setEnabled(True)
-        print(f"\nDelays: {delays}")
-
+        print(f"\nSync offsets (seek per player): {seek_ms_list} ms")
     def _on_sync_error(self, msg):
         self.sync_progress.setValue(0)
         self._set_sync_status(f"ERROR: {msg[:60]}", "#ef4444")
@@ -1550,9 +1685,9 @@ class LabelMarker(QWidget):
 
     def __init__(self, label_name, color, timestamp_str, parent=None):
         super().__init__(parent)
-        self.label_name = label_name
+        self.label_name    = label_name   # accessible by get_labels()
+        self.timestamp_str = timestamp_str  # accessible by get_labels()
         self._color = color
-        # No border on the widget — vertical lines came from stylesheet borders
         self.setStyleSheet("background-color: #0e0f11;")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 5, 8, 5)
@@ -1829,11 +1964,11 @@ class LabellingTab(QWidget):
         play_row.addWidget(place_btn)
         play_row.addStretch()
 
-        end_lbl = QLabel("05:42:10.000")
-        end_lbl.setStyleSheet(
+        self._end_lbl = QLabel("--:--:--.---")
+        self._end_lbl.setStyleSheet(
             "color: #9ca3af; font-size: 11px; font-family: 'Courier New'; letter-spacing: 1px;"
         )
-        play_row.addWidget(end_lbl)
+        play_row.addWidget(self._end_lbl)
         tl_layout.addLayout(play_row)
         center_layout.addWidget(tl_container)
 
@@ -1992,10 +2127,10 @@ class LabellingTab(QWidget):
         m = int((global_t % 3600) // 60)
         s = global_t % 60
         self.tl_tc.setText(f"{h:02d}:{m:02d}:{s:06.3f}")
-        # Update slider without triggering another seek
-        dur = max(1.0, sum(
-            sl.get_duration_sec() for sl in self.label_slots if sl.is_loaded()
-        ) / max(1, sum(1 for sl in self.label_slots if sl.is_loaded())))
+        # Drive slider from the reference slot's duration
+        loaded = [sl for sl in self.label_slots if sl.is_loaded()]
+        dur = loaded[0].get_duration_sec() if loaded else 1.0
+        dur = dur or 1.0
         self.tl_slider.blockSignals(True)
         self.tl_slider.setValue(int((global_t / dur) * 10000))
         self.tl_slider.blockSignals(False)
@@ -2003,12 +2138,13 @@ class LabellingTab(QWidget):
         self.eeg_label_2.set_playhead(global_t)
 
     def _on_timeline_scrub(self, value):
-        # Use real duration if slots are loaded, otherwise fall back
+        # Use the reference slot's duration (first loaded slot) — averaging
+        # durations across slots that may differ in length is incorrect.
         loaded = [sl for sl in self.label_slots if sl.is_loaded()]
         if loaded:
             dur = loaded[0].get_duration_sec() or 1.0
         else:
-            dur = 5 * 3600 + 42 * 60 + 10
+            dur = 1.0
         total_secs = (value / 10000) * dur
         h = int(total_secs // 3600)
         m = int((total_secs % 3600) // 60)
@@ -2024,18 +2160,26 @@ class LabellingTab(QWidget):
         Called from main window when navigating from Sync tab.
         video_slots_data: list of (path, offset_sec) tuples
         eeg_data:         list of (df, offset_sec) tuples
-        sync_result:      SyncResult for attaching sync controller
+        sync_result:      SyncResult
         """
         # Load videos into VLC slots
         for i, (path, offset) in enumerate(video_slots_data):
             if i < len(self.label_slots) and path:
                 self.label_slots[i].load(path, offset_sec=offset)
 
-        # Attach sync controller
-        loaded = [s for s in self.label_slots if s.is_loaded()]
-        offsets = [s._offset_sec for s in loaded]
-        dur = sync_result.global_duration if sync_result else 0.0
-        self._label_sync_ctrl.attach(loaded, offsets, global_duration=dur)
+        # Attach sync controller — pass offsets in seconds (float)
+        loaded   = [s for s in self.label_slots if s.is_loaded()]
+        offsets  = [s._offset_sec for s in loaded]
+        dur      = sync_result.global_duration if sync_result else 0.0
+        self._label_sync_ctrl.attach(loaded, offsets_sec=offsets,
+                                     global_duration=dur)
+
+        # Update the end-time label
+        if dur > 0:
+            h = int(dur // 3600)
+            m = int((dur % 3600) // 60)
+            s = dur % 60
+            self._end_lbl.setText(f"{h:02d}:{m:02d}:{s:06.3f}")
 
         # Load EEG data
         for i, (df, offset) in enumerate(eeg_data):
@@ -2086,26 +2230,25 @@ class LabellingTab(QWidget):
         labels = []
         for i in range(self.placed_layout.count() - 1):
             item = self.placed_layout.itemAt(i)
-            if item and item.widget():
-                w = item.widget()
-                children = w.findChildren(QLabel)
-                if len(children) >= 3:
-                    ts_str = children[1].text()
-                    name   = children[2].text()
-                    # Convert HH:MM:SS.mmm to seconds
-                    try:
-                        parts = ts_str.split(":")
-                        ts_sec = (float(parts[0]) * 3600
-                                  + float(parts[1]) * 60
-                                  + float(parts[2]))
-                    except Exception:
-                        ts_sec = 0.0
-                    labels.append({
-                        "timestamp_sec": round(ts_sec, 3),
-                        "timestamp_str": ts_str,
-                        "label":         name,
-                        "color":         getattr(w, "_color", ""),
-                    })
+            if item and item.widget() and isinstance(item.widget(), LabelMarker):
+                marker = item.widget()
+                ts_str = marker.timestamp_str
+                name   = marker.label_name
+                try:
+                    parts  = ts_str.split(":")
+                    ts_sec = (
+                        float(parts[0]) * 3600
+                        + float(parts[1]) * 60
+                        + float(parts[2])
+                    )
+                except Exception:
+                    ts_sec = 0.0
+                labels.append({
+                    "timestamp_sec": round(ts_sec, 3),
+                    "timestamp_str": ts_str,
+                    "label":         name,
+                    "color":         marker._color,
+                })
         return labels
 
     def _export_labels(self):
@@ -2178,7 +2321,10 @@ class BrainBattleApp(QMainWindow):
         # Tabs
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self.tabs.setDocumentMode(True)
+        # documentMode(True) on macOS merges the tab bar into the title bar
+        # region causing content to render under it. Keep it False.
+        self.tabs.setDocumentMode(False)
+        self.tabs.setContentsMargins(0, 0, 0, 0)
 
         self.live_tab = LiveMonitorTab()
         self.sync_tab = SyncReviewTab()
@@ -2201,14 +2347,25 @@ class BrainBattleApp(QMainWindow):
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import os
-    # Force Qt to use the FFmpeg backend instead of AVFoundation/VideoToolbox.
-    # This fixes hardware decode failures (-12909) on macOS with H264 files.
+    import os, traceback as _tb
     os.environ["QT_MEDIA_BACKEND"] = "ffmpeg"
 
     app = QApplication(sys.argv)
     app.setApplicationName("Brain Battle")
 
-    window = BrainBattleApp()
-    window.show()
+    # Wrap in try/except so any startup crash prints a real traceback
+    # instead of silently exiting (macOS Qt swallows C++ exceptions).
+    def _excepthook(exc_type, exc_value, exc_tb):
+        print("\n=== UNHANDLED EXCEPTION ===")
+        _tb.print_exception(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
+    try:
+        window = BrainBattleApp()
+        window.show()
+    except Exception:
+        _tb.print_exc()
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+
     sys.exit(app.exec())
