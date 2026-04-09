@@ -158,7 +158,7 @@ class VLCVideoSlot(QFrame):
         self._audio.setVolume(1.0)
         self._player.setAudioOutput(self._audio)
 
-        self._video_widget = QVideoWidget(self.window())
+        self._video_widget = QVideoWidget(self._container)
         self._video_widget.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )

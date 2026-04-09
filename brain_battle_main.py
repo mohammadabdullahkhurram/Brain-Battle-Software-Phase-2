@@ -1,7 +1,10 @@
+import os
+os.environ["QT_MEDIA_BACKEND"] = "ffmpeg"        # Must be set before any Qt multimedia imports
+os.environ["QT_FFMPEG_DISABLE_HW_DECODING"] = "1" # Disable VideoToolbox; force CPU software decode
+
 from pathlib import Path
 import sys
 import tempfile
-import os
 import datetime as _dt
 
 import numpy as _np
@@ -35,6 +38,69 @@ _INT32_MAX = 2_147_483_647
 def _clamp_ms(ms) -> int:
     """Clamp a millisecond value to Qt's int32 slider range."""
     return int(max(0, min(int(ms), _INT32_MAX)))
+
+
+# ── VideoSurface ──────────────────────────────────────────────────────────────
+# Pure QPainter-based video renderer.  Captures frames from a QVideoSink and
+# draws them inside paintEvent — no native NSView / Metal layer, so it is
+# properly clipped by its parent widget on macOS and cannot overflow the header
+# or tab bar.
+
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
+from PyQt6.QtGui import QImage
+from PyQt6.QtCore import pyqtSlot
+
+class VideoSurface(QWidget):
+    """
+    Software-rendered video surface.
+    Captures frames from a QVideoSink, converts them to QImage via
+    QPainter — no native NSView / Metal layer, so it cannot overflow
+    its parent widget on macOS.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._frame_image: QImage | None = None
+        self.setStyleSheet("background-color: #050506;")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    @pyqtSlot(QVideoFrame)
+    def on_frame(self, frame: QVideoFrame):
+        if not frame.isValid():
+            return
+
+        # Strategy 1: map frame to CPU memory, then convert to QImage
+        mapped = frame.map(QVideoFrame.MapMode.ReadOnly)
+        try:
+            img = frame.toImage()
+        finally:
+            if mapped:
+                frame.unmap()
+
+        if img.isNull():
+            return
+
+        # Keep a deep copy (frame data may be freed after this slot returns)
+        self._frame_image = img.convertToFormat(
+            QImage.Format.Format_RGB32
+        ).copy()
+        self.update()   # schedule repaint on main thread
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self._frame_image and not self._frame_image.isNull():
+            scaled = self._frame_image.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self.width()  - scaled.width())  // 2
+            y = (self.height() - scaled.height()) // 2
+            painter.drawImage(x, y, scaled)
+        else:
+            painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        painter.end()
 
 
 
@@ -818,23 +884,27 @@ class MainEditorSyncWorker(QThread):
 
 class SyncReviewTab(QWidget):
     """
-    Video playback uses python-vlc directly — exactly like MainEditor.py:
+    Video playback uses VLC's vmem (video-memory) output.
 
-        ex.media_players[i] = vlc.MediaPlayer()
-        ex.media_players[i].set_hwnd(int(ex.video_widgets[i].winId()))
-        media = vlc.Media(Path(path).as_uri())
-        ex.media_players[i].set_media(media)
-
-    VLC renders into the native window handle of each QFrame container.
-    This bypasses Qt's entire multimedia pipeline — no Metal, no VideoToolbox,
-    no codec issues. Works identically to MainEditor.py on macOS.
+    VLC decodes H.264 via its own codecs (with software fallback when
+    VideoToolbox fails) and writes decoded BGRA pixels into a ctypes
+    buffer.  A VLC 'display' callback fires for each frame, converts
+    the buffer to QImage, and updates a VideoSurface widget that renders
+    it via QPainter — no native NSView or Metal layer is created so the
+    video is fully clipped within its slot and cannot overflow the header.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.media_players  = [None, None, None, None]   # vlc.MediaPlayer | None
-        self.video_paths    = [None, None, None, None]
-        self.video_widgets  = []                          # QFrame containers
+
+        # One VLC media_player per slot
+        self.media_players:  list = [None, None, None, None]
+        self._video_widgets_qt: list = [None, None, None, None]  # VideoSurface refs
+        # Per-slot vmem state dicts (buf, width, height, callbacks) – kept
+        # in a list so that Python’s GC never frees the ctypes callback objects.
+        self._vmem_states:   list = [None, None, None, None]
+        self.video_paths     = [None, None, None, None]
+        self.video_widgets   = []   # container QWidgets
 
         self.eeg_file_name_1 = None
         self.eeg_file_name_2 = None
@@ -842,13 +912,15 @@ class SyncReviewTab(QWidget):
         self.sync_result = None
         self._worker     = None
         self._temp_paths   = []
-        self._delays       = []   # normalised per-clip delays (set after sync completes)
-        self._residuals_ms = []   # keyframe lead-in per clip in ms (set after sync completes)
+        self._delays       = []
+        self._residuals_ms = []
         self._post_sync_offsets_ms = [0, 0, 0, 0]
 
         self._pos_timer = QTimer(self)
         self._pos_timer.setInterval(100)
         self._pos_timer.timeout.connect(self._poll_position)
+
+        self._app_ref = None
 
         self._build()
 
@@ -1027,7 +1099,7 @@ class SyncReviewTab(QWidget):
             slot_layout.setContentsMargins(0, 0, 0, 0)
             slot_layout.setSpacing(0)
 
-            # ── Header bar (pure Qt, no native view) ──────────────────────────
+            # ── Header bar ────────────────────────────────────────────────────────
             hdr = QWidget()
             hdr.setFixedHeight(HEADER_H)
             hdr.setStyleSheet("background-color: #0e0f11; border-bottom: 1px solid #2a2d35;")
@@ -1155,7 +1227,7 @@ class SyncReviewTab(QWidget):
         self.tc_label.setObjectName("timecode")
         self.tc_label.setFixedWidth(110)
 
-        # Mirrors MainEditor.py time_slider — range is in ms pre-sync
+        # Slider range in ms
         self.time_slider = QSlider(Qt.Orientation.Horizontal)
         self.time_slider.setRange(0, 0)
         self.time_slider.setValue(0)
@@ -1182,71 +1254,127 @@ class SyncReviewTab(QWidget):
         self.sync_btn.clicked.connect(self._run_sync)
         self.goto_label_btn.clicked.connect(self._request_label_tab)
 
-    # ── Video upload — mirrors MainEditor.py upload_video() with vlc ──────────
+    # ── Video upload — VLC vmem ────────────────────────────────────────────────
 
-    def _load_video_vlc(self, video_num, path):
+
+    def _load_video_vmem(self, video_num, path):
         """
-        Mirrors MainEditor.py __main__ block exactly:
+        Load a video using VLC's video-memory (vmem) callbacks.
 
-            ex.media_players[i] = vlc.MediaPlayer()
-            ex.media_players[i].set_hwnd(int(ex.video_widgets[i].winId()))
-            media = vlc.Media(Path(path).as_uri())
-            ex.media_players[i].set_media(media)
-
-        VLC renders directly into the native window handle — no Qt multimedia
-        pipeline, no Metal, no VideoToolbox, no codec issues.
+        VLC decodes the video with its own codec stack (software fallback
+        when VideoToolbox fails) and writes BGRA pixels into a ctypes buffer.
+        Each decoded frame fires a Python callback that pushes a QImage into
+        the matching VideoSurface widget, which renders it with QPainter.
+        No native NSView is created, so the video cannot overflow the header.
         """
+        import ctypes
+
         i = video_num - 1
         self.video_paths[i] = path
 
-        # Create VLC player
+        container = self.video_widgets[i]
+
+        # ── Tear down any existing player ──────────────────────────────────
+        old = self.media_players[i]
+        if old is not None:
+            old.stop()
+        old_vw = self._video_widgets_qt[i]
+        if old_vw is not None:
+            if container.layout():
+                container.layout().removeWidget(old_vw)
+            old_vw.setParent(None)
+            old_vw.deleteLater()
+
+        # ── Create VideoSurface inside the container ───────────────────────
+        surface = VideoSurface(container)
+        if container.layout() is None:
+            from PyQt6.QtWidgets import QVBoxLayout as _VBL
+            _lay = _VBL(container)
+            _lay.setContentsMargins(0, 0, 0, 0)
+            _lay.setSpacing(0)
+        container.layout().addWidget(surface)
+        surface.show()
+        self._video_widgets_qt[i] = surface
+
+        # ── Probe video dimensions ────────────────────────────────────
+        width, height = 1920, 1080  # safe default
+        try:
+            import ffmpeg as _ff
+            probe = _ff.probe(path)
+            vs = next((s for s in probe["streams"] if s["codec_type"] == "video"), None)
+            if vs:
+                width  = int(vs.get("width",  1920))
+                height = int(vs.get("height", 1080))
+        except Exception:
+            pass
+
+        # ── Allocate BGRA frame buffer ─────────────────────────────────
+        pitch = width * 4
+        buf   = (ctypes.c_uint8 * (pitch * height))()
+
+        # ── VLC vmem callbacks ───────────────────────────────────────
+        # These are called from VLC’s decode thread.
+
+        @vlc.CallbackDecorators.VideoLockCb
+        def _lock(opaque, planes):
+            planes[0] = ctypes.cast(buf, ctypes.c_void_p)
+            return None
+
+        @vlc.CallbackDecorators.VideoUnlockCb
+        def _unlock(opaque, picture, planes):
+            pass  # nothing to do; buf is still valid
+
+        @vlc.CallbackDecorators.VideoDisplayCb
+        def _display(opaque, picture):
+            # Called on VLC decode thread — push update to main thread
+            raw = bytes(buf)
+            w, h = width, height
+            img  = QImage(raw, w, h, w * 4, QImage.Format.Format_RGB32)
+            surface._frame_image = img.copy()
+            QTimer.singleShot(0, surface.update)
+
+        # ── Create VLC player with vmem output ──────────────────────
         player = vlc.MediaPlayer()
-        self.media_players[i] = player
-
-        # Set WA_NativeWindow now (deferred from build time).
-        # The widget is fully laid out at this point so the NSView is
-        # created at the correct screen position, not at (0,0).
-        widget = self.video_widgets[i]
-        widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        widget.winId()  # force handle creation before reading it
-        win_id = int(widget.winId())
-
-        # Platform-specific handle — mirrors MainEditor.py set_hwnd()
-        if sys.platform == "darwin":
-            player.set_nsobject(win_id)
-        elif sys.platform == "win32":
-            player.set_hwnd(win_id)
-        else:
-            player.set_xwindow(win_id)
+        player.video_set_callbacks(_lock, _unlock, _display, None)
+        player.video_set_format("RV32", width, height, pitch)
 
         media = vlc.Media(Path(path).as_uri())
         player.set_media(media)
 
-        # Wire position/duration via VLC event manager
+        # Keep callbacks + buffer alive on the player object
+        player._vmem = (_lock, _unlock, _display, buf)
+
+        self.media_players[i] = player
+        self._vmem_states[i]  = player._vmem
+
+        # Wire VLC event manager for position / duration
         em = player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged,
-                        lambda e: self._vlc_time_changed(i, e))
+                        lambda e, _i=i: self._vlc_time_changed(_i, e))
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged,
-                        lambda e: self._vlc_length_changed(i, e))
+                        lambda e, _i=i: self._vlc_length_changed(_i, e))
 
     def _vlc_time_changed(self, player_idx, event):
-        """VLC time callback — fires on worker thread, post to main thread."""
+        """VLC time callback — fires on VLC thread; post to main thread."""
         if self.sync_result is not None:
             return
-        # VLC time is in ms
-        ms = self.media_players[player_idx].get_time()
-        if ms >= 0:
-            QTimer.singleShot(0, lambda: self._position_changed(ms))
+        p = self.media_players[player_idx]
+        if p:
+            ms = p.get_time()
+            if ms >= 0:
+                QTimer.singleShot(0, lambda: self._position_changed(ms))
 
     def _vlc_length_changed(self, player_idx, event):
-        """VLC length callback."""
-        ms = self.media_players[player_idx].get_length()
-        if ms > 0:
-            QTimer.singleShot(0, lambda: self._duration_changed(ms))
+        """VLC length callback — fires on VLC thread; post to main thread."""
+        p = self.media_players[player_idx]
+        if p:
+            ms = p.get_length()
+            if ms > 0:
+                QTimer.singleShot(0, lambda: self._duration_changed(ms))
 
     def _on_file_loaded(self, source_id: int, path: str):
         if source_id < 4:
-            self._load_video_vlc(source_id + 1, path)
+            self._load_video_vmem(source_id + 1, path)
             self.play_btn.setEnabled(True)
             slot = self._video_slots[source_id]
             slot._ph.hide()
@@ -1272,74 +1400,50 @@ class SyncReviewTab(QWidget):
             except Exception as e:
                 print(f"[EEG 2] {e}")
 
-    # ── Playback — mirrors MainEditor.py play_pause_all_videos() ─────────────
+    def _qt_position_changed(self, player_idx, ms):
+        """Unused stub — kept for import compatibility."""
+        pass
+
+    def _qt_duration_changed(self, player_idx, ms):
+        """Unused stub — kept for import compatibility."""
+        pass
+
+    def _raise_overlays(self):
+        """No-op — vmem output uses no native view; no raise needed."""
+        pass
+
+    # ── Playback ───────────────────────────────────────────────────────────────
 
     def _toggle_play(self):
-        """
-        Mirrors:
-            for player in self.media_players:
-                if player:
-                    if player.state() == QMediaPlayer.PlayingState:
-                        player.pause()
-                    else:
-                        player.play()
-        """
-        any_playing = any(
-            p and p.is_playing()
-            for p in self.media_players
-        )
+        any_playing = any(p and p.is_playing() for p in self.media_players)
         if any_playing:
             for p in self.media_players:
-                if p:
-                    p.pause()
+                if p: p.pause()
             self.play_btn.setText("▶  PLAY")
             self._pos_timer.stop()
         else:
-            # Pause all first, seek all to current position, then start all
-            # in the tightest possible burst to minimise inter-player drift.
-            active = [p for p in self.media_players if p]
-
-            # content_floor_ms = largest per-clip seek offset (ms).
-            # Play/resume never seeks before this point.
-            seek_targets = getattr(self, "_residuals_ms", [])  # reused field
-            content_floor_ms = _clamp_ms(max(seek_targets)) if seek_targets else 0
-
-            # Each player is at its own file position (its individual seek offset).
-            # After sync they are already aligned — just play them all in a tight
-            # burst without re-seeking, which would break the per-clip offsets.
-            for p in active:
-                p.pause()
-
-            # Start all in one tight burst
-            for p in active:
-                p.play()
-
+            for p in self.media_players:
+                if p: p.play()
             self.play_btn.setText("⏸  PAUSE")
             self._pos_timer.start()
 
-    # ── Scrub — mirrors MainEditor.py set_position() ─────────────────────────
+    # ── Scrub ──────────────────────────────────────────────────────────────────
 
     def _set_position(self, position_ms):
-        # position_ms is the slider value = file position of the reference player
-        # (the latest-starting clip, which has seek_ms = max_seek = slider_minimum).
-        # Each other player[i] needs: position_ms - max_seek + seek_ms[i]
         seek_targets = getattr(self, "_residuals_ms", [])
         max_seek = max(seek_targets) if seek_targets else 0
-
         for i, p in enumerate(self.media_players):
             if p:
                 if seek_targets and i < len(seek_targets):
-                    # Convert global slider position to this player's file position
                     player_pos = position_ms - max_seek + seek_targets[i]
                     p.set_time(_clamp_ms(player_pos))
                 else:
                     p.set_time(_clamp_ms(position_ms))
-
         self._update_tc(position_ms)
         self.eeg_review_1.set_playhead(position_ms / 1000.0)
         self.eeg_review_2.set_playhead(position_ms / 1000.0)
 
-    # ── Slider callbacks — mirrors MainEditor.py position/duration_changed ────
+    # ── Slider callbacks ───────────────────────────────────────────────────────
 
     def _position_changed(self, ms):
         if self.sync_result is not None:
@@ -1361,18 +1465,56 @@ class SyncReviewTab(QWidget):
             self.duration_label.setText(f"{h:02d}:{m:02d}:{s:06.3f}")
 
     def _poll_position(self):
-        """100ms timer — drives slider, timecode and EEG playhead from VLC."""
+        """100ms timer — drives slider and EEG playhead from VLC."""
         seek_targets = getattr(self, "_residuals_ms", [])
         max_seek     = max(seek_targets) if seek_targets else 0
-
         for i, p in enumerate(self.media_players):
             if p:
                 t = p.get_time()
                 if t < 0:
                     continue
-                # Convert player file position to global timeline position.
-                # Each player sits at file_pos = global_t + seek_ms[i] - max_seek
-                # So: global_t = file_pos - seek_ms[i] + max_seek
+                my_seek  = seek_targets[i] if seek_targets and i < len(seek_targets) else 0
+                global_t = _clamp_ms(t - my_seek + max_seek)
+                self.time_slider.blockSignals(True)
+                self.time_slider.setValue(global_t)
+                self.time_slider.blockSignals(False)
+                self._update_tc(global_t)
+                self.eeg_review_1.set_playhead(global_t / 1000.0)
+                self.eeg_review_2.set_playhead(global_t / 1000.0)
+                break
+
+
+    # ── Slider callbacks ───────────────────────────────────────────────────────
+
+    def _position_changed(self, ms):
+        if self.sync_result is not None:
+            return
+        self.time_slider.blockSignals(True)
+        self.time_slider.setValue(_clamp_ms(ms))
+        self.time_slider.blockSignals(False)
+        self._update_tc(ms)
+
+    def _duration_changed(self, ms):
+        if self.sync_result is not None:
+            return
+        if ms > 0:
+            self.time_slider.setRange(0, _clamp_ms(ms))
+            secs = ms / 1000.0
+            h = int(secs // 3600)
+            m = int((secs % 3600) // 60)
+            s = secs % 60
+            self.duration_label.setText(f"{h:02d}:{m:02d}:{s:06.3f}")
+
+    def _poll_position(self):
+        """100ms timer — drives slider from Qt player position."""
+        seek_targets = getattr(self, "_residuals_ms", [])
+        max_seek     = max(seek_targets) if seek_targets else 0
+
+        for i, p in enumerate(self.media_players):
+            if p:
+                t = p.position()  # Qt API: position() in ms
+                if t < 0:
+                    continue
                 my_seek = seek_targets[i] if seek_targets and i < len(seek_targets) else 0
                 global_t = _clamp_ms(t - my_seek + max_seek)
                 self.time_slider.blockSignals(True)
@@ -1490,48 +1632,35 @@ class SyncReviewTab(QWidget):
             eeg_offsets=eeg_offsets,
         )
 
-        # ── Load original files into VLC and seek to sync offset ────────────
-        # Key insight: set_time() must be called AFTER play() has been called
-        # once (so VLC opens the file) but the timing matters.
-        # We use a polling approach: check every 100ms until VLC reports a
-        # valid duration (meaning the file is fully opened), then seek+pause.
+        # ── Reload files into VLC vmem players and seek to sync offsets ───────
         target_seeks = [_clamp_ms(s) for s in seek_ms_list]
 
         for i, path in enumerate(video_paths):
-            if i < len(self.media_players) and self.media_players[i] and path:
+            p = self.media_players[i] if i < len(self.media_players) else None
+            if p and path:
                 media = vlc.Media(Path(path).as_uri())
-                self.media_players[i].set_media(media)
-                # Start playing so VLC opens the file and buffers
-                self.media_players[i].play()
+                p.set_media(media)
+                p.play()   # VLC must play() once before set_time() works
 
-        # Poll until all players report a valid duration, then seek+pause.
-        # Timeout after 10 seconds to avoid hanging if a file fails to open.
         _poll_count = [0]
-        _max_polls  = 100   # 100 * 100ms = 10 seconds max
+        _max_polls  = 100
 
         def _wait_and_seek():
             _poll_count[0] += 1
             active = [p for p in self.media_players if p]
-
-            # Check if all active players have a known duration (file is open)
             all_ready = all(p.get_length() > 0 for p in active)
 
             if not all_ready and _poll_count[0] < _max_polls:
                 QTimer.singleShot(100, _wait_and_seek)
                 return
 
-            if not all_ready:
-                print("[Sync] Warning: some players did not report duration in time")
-
-            # All open — pause and seek each to its sync point
             for i, p in enumerate(self.media_players):
                 if p:
-                    p.pause()
                     seek = target_seeks[i] if i < len(target_seeks) else 0
+                    p.pause()
                     p.set_time(seek)
                     print(f"  player {i}: set_time({seek}ms)")
 
-            # Build slider range over the shared content window
             max_seek_ms    = max(target_seeks) if target_seeks else 0
             content_end_ms = 0
             for p in self.media_players:
@@ -2328,6 +2457,7 @@ class BrainBattleApp(QMainWindow):
 
         self.live_tab = LiveMonitorTab()
         self.sync_tab = SyncReviewTab()
+        self.sync_tab._app_ref = self   # so SyncReviewTab can call _raise_overlays
         self.label_tab = LabellingTab()
 
         self.tabs.addTab(self.live_tab, "01  LIVE MONITOR")
