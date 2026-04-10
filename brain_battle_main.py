@@ -56,7 +56,7 @@ class VideoSurface(QWidget):
         self._vh     = 1
         self._vpitch = 4
         self._timer  = QTimer(self)
-        self._timer.setInterval(33)
+        self._timer.setInterval(50)  # 20 fps — sufficient for review, halves repaint CPU
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -588,14 +588,20 @@ class SyncReviewTab(QWidget):
         container.layout().addWidget(surface); surface.show()
         self._video_widgets_qt[i] = surface
 
-        # ── Probe video dimensions via ffprobe ────────────────────────────────
-        width, height = 1920, 1080
+        # ── Vmem buffer at half resolution ────────────────────────────────────
+        # Full-res vmem (1920×1080 × 4 bytes × 4 videos × 30fps) saturates the
+        # CPU with swscaler yuv420p→bgra conversion. Half-res cuts pixel count
+        # by 75% — VLC downscales in its own fast pipeline, swscaler converts
+        # a much smaller frame. Display quality is identical at screen size.
+        src_w, src_h = 1920, 1080
         try:
             import ffmpeg as _ff
             probe = _ff.probe(path)
             vs = next((s for s in probe["streams"] if s["codec_type"] == "video"), None)
-            if vs: width = int(vs.get("width", 1920)); height = int(vs.get("height", 1080))
+            if vs: src_w = int(vs.get("width", 1920)); src_h = int(vs.get("height", 1080))
         except Exception: pass
+        width  = src_w // 2
+        height = src_h // 2
 
         pitch = width * 4
 
@@ -622,10 +628,14 @@ class SyncReviewTab(QWidget):
             pass  # VideoSurface._tick() handles promotion r→d and update()
 
         # ── Create VLC player ─────────────────────────────────────────────────
-        player = vlc.MediaPlayer()
+        # Hardware decode via VideoToolbox — much faster than avcodec for 4 streams.
+        # swscaler yuv420p→bgra warning is cosmetic; the conversion is fast enough.
+        _inst = vlc.Instance()
+        player = _inst.media_player_new()
+        player._vlc_instance_ref = _inst  # keep instance alive (GC protection)
         player.video_set_callbacks(_lock, _unlock, _display, None)
         player.video_set_format("RV32", width, height, pitch)
-        media = vlc.Media(Path(path).as_uri()); player.set_media(media)
+        media = _inst.media_new(Path(path).as_uri()); player.set_media(media)
         # Keep callbacks + buffers alive (GC protection)
         player._vmem_refs = (_lock, _unlock, _display, bufs, st)
         self.media_players[i] = player
@@ -634,6 +644,23 @@ class SyncReviewTab(QWidget):
         em = player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged,   lambda e, _i=i: self._vlc_time_changed(_i, e))
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged, lambda e, _i=i: self._vlc_length_changed(_i, e))
+
+        # Pre-warm: play then pause so the vmem decoder pipeline is fully
+        # initialised before the user clicks Play. Without this, the first
+        # Play press starts decoding from scratch and the user perceives a
+        # delay / needs a second click to see video.
+        def _prewarm(_p=player):
+            _p.play()
+            # Wait for VLC to reach Playing state, then pause at frame 0
+            def _pause_when_ready(_count=[0], _pp=_p):
+                if _pp.get_state() == vlc.State.Playing:
+                    _pp.pause()
+                    _pp.set_time(0)
+                elif _count[0] < 50:          # give up after 5 s
+                    _count[0] += 1
+                    QTimer.singleShot(100, _pause_when_ready)
+            QTimer.singleShot(100, _pause_when_ready)
+        QTimer.singleShot(200, _prewarm)
 
     def _raise_ui_above_vlc(self) -> None:
         pass  # vmem uses no native view — no raise needed
@@ -660,24 +687,60 @@ class SyncReviewTab(QWidget):
             slot._status.setText(f"— {short}"); slot._status.setStyleSheet("color: #d4d0c8; font-size: 9px; font-family: 'Courier New';")
         elif source_id == 4:
             self.eeg_file_name_1 = path
-            try: df = pd.read_csv(path); self.eeg_review_1.load(df, offset_sec=0.0)
-            except Exception as e: print(f"[EEG 1] {e}")
+            self._load_eeg_async(path, self.eeg_review_1)
         elif source_id == 5:
             self.eeg_file_name_2 = path
-            try: df = pd.read_csv(path); self.eeg_review_2.load(df, offset_sec=0.0)
-            except Exception as e: print(f"[EEG 2] {e}")
+            self._load_eeg_async(path, self.eeg_review_2)
+
+    def _load_eeg_async(self, path: str, widget) -> None:
+        """Load a Muse CSV via a QThread so delivery back to the main thread is safe."""
+        # QTimer.singleShot from a plain daemon thread is not safe on macOS —
+        # it silently drops the call. Use a QThread with a signal instead.
+        class _EEGLoader(QThread):
+            done = pyqtSignal(object)  # emits the DataFrame
+            def __init__(self, p, parent=None):
+                super().__init__(parent); self._p = p
+            def run(self):
+                try:
+                    df = pd.read_csv(self._p)
+                    print(f"[EEG load] columns: {list(df.columns)[:8]}  rows: {len(df)}")
+                    col_map = {c.lower(): c for c in df.columns}
+                    if 'timestamps' not in df.columns and 'timestamps' in col_map:
+                        df = df.rename(columns={col_map['timestamps']: 'timestamps'})
+                    self.done.emit(df)
+                except Exception as e:
+                    print(f"[EEG load error] {e}")
+
+        loader = _EEGLoader(path, parent=self)
+        # Keep reference so GC doesn't destroy it before it finishes
+        if not hasattr(self, '_eeg_loaders'):
+            self._eeg_loaders = []
+        self._eeg_loaders.append(loader)
+
+        def _on_done(df, _w=widget, _l=loader):
+            try:
+                _w.load(df, offset_sec=0.0)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+            finally:
+                if _l in self._eeg_loaders:
+                    self._eeg_loaders.remove(_l)
+
+        loader.done.connect(_on_done)
+        loader.start()
 
     def _raise_overlays(self): pass
 
     def _toggle_play(self):
-        any_playing = any(p and p.is_playing() for p in self.media_players)
+        # Use get_state() — is_playing() returns False during VLC's brief
+        # opening phase on first play, causing the click to appear ignored.
+        active = [p for p in self.media_players if p]
+        any_playing = any(p.get_state() == vlc.State.Playing for p in active)
         if any_playing:
-            for p in self.media_players:
-                if p: p.pause()
+            for p in active: p.pause()
             self.play_btn.setText("▶  PLAY"); self._pos_timer.stop()
         else:
-            for p in self.media_players:
-                if p: p.play()
+            for p in active: p.play()
             self.play_btn.setText("⏸  PAUSE"); self._pos_timer.start()
 
     def _set_position(self, position_ms):
@@ -764,7 +827,8 @@ class SyncReviewTab(QWidget):
         for i, path in enumerate(video_paths):
             p = self.media_players[i] if i < len(self.media_players) else None
             if p and path:
-                media = vlc.Media(Path(path).as_uri()); p.set_media(media); p.play()
+                _pinst = getattr(p, '_vlc_instance_ref', None)
+                media = (_pinst.media_new if _pinst else vlc.Media)(Path(path).as_uri()); p.set_media(media); p.play()
 
         _poll_count = [0]
         def _wait_and_seek():

@@ -158,6 +158,8 @@ class _MuseScanThread(QThread):
                         seen.add(name)
                         devices.append({"name": name, "address": addr})
             self.found.emit(devices)
+            if not devices:
+                print(f"[muselsl scan] No devices parsed. Raw output:\n{combined[:500]}")
         except subprocess.TimeoutExpired:
             self.error.emit("Scan timed out after 20s.")
         except Exception as exc:
@@ -641,17 +643,31 @@ class EEGLiveWidget(QFrame):
         The muselsl stream must already be running (start_stream called first,
         or CONNECT was clicked). If the stream is not yet up, start it first.
         Recording runs until stop_recording() is called.
+
+        The _pending_record_path guard prevents a second timer-based call from
+        launching a duplicate muselsl record process if start_recording() is
+        called twice before the 4.5 s delay fires.
         """
+        # Already recording or another start is pending — do nothing
+        if (self._record_proc and self._record_proc.poll() is None) or \
+                getattr(self, "_pending_record_path", None) is not None:
+            return
+
         if not self._is_streaming:
-            # Auto-start the stream first, then record after it advertises
             device_name = (
                 self._connected_device["name"] if self._connected_device else ""
             )
+            self._pending_record_path = save_path
             self.start_stream(device_name=device_name)
-            # Delay record start to let stream come up (stream has 3s delay + 1s buffer)
-            QTimer.singleShot(4500, lambda: self._launch_record_proc(save_path))
+            QTimer.singleShot(4500, self._launch_pending_record)
         else:
             self._launch_record_proc(save_path)
+
+    def _launch_pending_record(self):
+        path = getattr(self, "_pending_record_path", None)
+        self._pending_record_path = None
+        if path:
+            self._launch_record_proc(path)
 
     def _launch_record_proc(self, save_path: str):
         """
@@ -991,31 +1007,44 @@ class EEGReviewWidget(QFrame):
 
     def load(self, df: pd.DataFrame, offset_sec: float = 0.0,
              device_name: str = ""):
-        self._df = df.copy()
-        self._offset_sec = offset_sec
-        first_ts = float(df["timestamps"].iloc[0])
-        self._df["global_t"] = (df["timestamps"] - first_ts) - offset_sec
-        self._render_waveform()
-        self._render_bandpower_full()
-        duration = float(
-            self._df["global_t"].iloc[-1] - self._df["global_t"].iloc[0]
-        )
-        sign = "+" if offset_sec >= 0 else ""
-        self._offset_lbl.setText(f"offset {sign}{offset_sec:.3f}s  ·  {duration:.0f}s")
-        label = device_name or f"MUSE-S {self.channel_id}"
-        boxer = BOXER_LABELS.get(device_name, "")
-        display = f"EEG {self.channel_id}  —  {label}"
-        if boxer:
-            display += f"  [{boxer}]"
-        self._title_lbl.setText(display)
-        self._title_lbl.setStyleSheet(
-            "color: #d4d0c8; font-size: 12px; font-family: 'Courier New';"
-        )
-        self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
-        self._placeholder.setVisible(False)
-        for vl in self._vlines.values():
-            vl.set_visible(True)
-        self._show_view(self._view_mode)
+        if df is None or df.empty or "timestamps" not in df.columns:
+            print(f"[EEGReviewWidget {self.channel_id}] load() skipped — "
+                  f"DataFrame is None, empty, or missing 'timestamps' column.")
+            return
+        try:
+            self._df = df.copy()
+            self._offset_sec = offset_sec
+            first_ts = float(df["timestamps"].iloc[0])
+            self._df["global_t"] = (df["timestamps"] - first_ts) - offset_sec
+            self._render_waveform()
+            self._render_bandpower_full()
+            self._wave_canvas.draw()
+            self._band_canvas.draw()
+            duration = float(
+                self._df["global_t"].iloc[-1] - self._df["global_t"].iloc[0]
+            )
+            sign = "+" if offset_sec >= 0 else ""
+            self._offset_lbl.setText(f"offset {sign}{offset_sec:.3f}s  ·  {duration:.0f}s")
+            label = device_name or f"MUSE-S {self.channel_id}"
+            boxer = BOXER_LABELS.get(device_name, "")
+            display = f"EEG {self.channel_id}  —  {label}"
+            if boxer:
+                display += f"  [{boxer}]"
+            self._title_lbl.setText(display)
+            self._title_lbl.setStyleSheet(
+                "color: #d4d0c8; font-size: 12px; font-family: 'Courier New';"
+            )
+            self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
+            self._placeholder.setVisible(False)
+            for vl in self._vlines.values():
+                vl.set_visible(True)
+            self._show_view(self._view_mode)
+            print(f"[EEGReviewWidget {self.channel_id}] load() OK — "
+                  f"{len(self._df)} rows, duration={duration:.1f}s")
+        except Exception as _e:
+            import traceback
+            print(f"[EEGReviewWidget {self.channel_id}] load() EXCEPTION: {_e}")
+            traceback.print_exc()
 
     def set_playhead(self, global_t: float):
         if self._df is None:
