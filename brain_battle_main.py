@@ -571,7 +571,6 @@ class SyncReviewTab(QWidget):
         i = video_num - 1; self.video_paths[i] = path
         container = self.video_widgets[i]
 
-        # ── Tear down old player ───────────────────────────────────────────────
         old = self.media_players[i]
         if old is not None: old.stop()
         old_vw = self._video_widgets_qt[i]
@@ -580,7 +579,6 @@ class SyncReviewTab(QWidget):
             old_vw.setParent(None); old_vw.deleteLater()
             self._video_widgets_qt[i] = None
 
-        # ── Create VideoSurface inside container ───────────────────────────────
         surface = VideoSurface(container)
         if container.layout() is None:
             from PyQt6.QtWidgets import QVBoxLayout as _VBL
@@ -588,11 +586,6 @@ class SyncReviewTab(QWidget):
         container.layout().addWidget(surface); surface.show()
         self._video_widgets_qt[i] = surface
 
-        # ── Vmem buffer at half resolution ────────────────────────────────────
-        # Full-res vmem (1920×1080 × 4 bytes × 4 videos × 30fps) saturates the
-        # CPU with swscaler yuv420p→bgra conversion. Half-res cuts pixel count
-        # by 75% — VLC downscales in its own fast pipeline, swscaler converts
-        # a much smaller frame. Display quality is identical at screen size.
         src_w, src_h = 1920, 1080
         try:
             import ffmpeg as _ff
@@ -600,70 +593,48 @@ class SyncReviewTab(QWidget):
             vs = next((s for s in probe["streams"] if s["codec_type"] == "video"), None)
             if vs: src_w = int(vs.get("width", 1920)); src_h = int(vs.get("height", 1080))
         except Exception: pass
-        width  = src_w // 2
-        height = src_h // 2
+        width = src_w // 2; height = src_h // 2; pitch = width * 4
 
-        pitch = width * 4
-
-        # Triple-buffer: slots w(rite), r(eady), d(isplay)
-        import ctypes as _ct
         bufs = [(ctypes.c_uint8 * (pitch * height))() for _ in range(3)]
         st   = {'w': 0, 'r': 1, 'd': 2, 'fresh': False}
         surface.attach_vmem(bufs, st, width, height, pitch)
 
-        # ── VLC vmem callbacks (called on VLC decode thread) ──────────────────
         @vlc.CallbackDecorators.VideoLockCb
         def _lock(opaque, planes):
-            planes[0] = ctypes.cast(bufs[st['w']], ctypes.c_void_p)
-            return None
+            planes[0] = ctypes.cast(bufs[st['w']], ctypes.c_void_p); return None
 
         @vlc.CallbackDecorators.VideoUnlockCb
         def _unlock(opaque, picture, planes):
-            # Rotate write→ready; mark fresh for the display tick
-            st['w'], st['r'] = st['r'], st['w']
-            st['fresh'] = True
+            st['w'], st['r'] = st['r'], st['w']; st['fresh'] = True
 
         @vlc.CallbackDecorators.VideoDisplayCb
-        def _display(opaque, picture):
-            pass  # VideoSurface._tick() handles promotion r→d and update()
+        def _display(opaque, picture): pass
 
-        # ── Create VLC player ─────────────────────────────────────────────────
-        # Hardware decode via VideoToolbox — much faster than avcodec for 4 streams.
-        # swscaler yuv420p→bgra warning is cosmetic; the conversion is fast enough.
         _inst = vlc.Instance()
         player = _inst.media_player_new()
-        player._vlc_instance_ref = _inst  # keep instance alive (GC protection)
+        player._vlc_instance_ref = _inst
         player.video_set_callbacks(_lock, _unlock, _display, None)
         player.video_set_format("RV32", width, height, pitch)
         media = _inst.media_new(Path(path).as_uri()); player.set_media(media)
-        # Keep callbacks + buffers alive (GC protection)
         player._vmem_refs = (_lock, _unlock, _display, bufs, st)
         self.media_players[i] = player
 
-        # Wire VLC events for slider / duration
         em = player.event_manager()
         em.event_attach(vlc.EventType.MediaPlayerTimeChanged,   lambda e, _i=i: self._vlc_time_changed(_i, e))
         em.event_attach(vlc.EventType.MediaPlayerLengthChanged, lambda e, _i=i: self._vlc_length_changed(_i, e))
 
-        # Pre-warm: play then pause so the vmem decoder pipeline is fully
-        # initialised before the user clicks Play. Without this, the first
-        # Play press starts decoding from scratch and the user perceives a
-        # delay / needs a second click to see video.
         def _prewarm(_p=player):
             _p.play()
-            # Wait for VLC to reach Playing state, then pause at frame 0
             def _pause_when_ready(_count=[0], _pp=_p):
                 if _pp.get_state() == vlc.State.Playing:
-                    _pp.pause()
-                    _pp.set_time(0)
-                elif _count[0] < 50:          # give up after 5 s
-                    _count[0] += 1
-                    QTimer.singleShot(100, _pause_when_ready)
+                    _pp.pause(); _pp.set_time(0)
+                elif _count[0] < 50:
+                    _count[0] += 1; QTimer.singleShot(100, _pause_when_ready)
             QTimer.singleShot(100, _pause_when_ready)
         QTimer.singleShot(200, _prewarm)
 
     def _raise_ui_above_vlc(self) -> None:
-        pass  # vmem uses no native view — no raise needed
+        pass  # vmem uses no native view
 
     def _vlc_time_changed(self, player_idx, event):
         if self.sync_result is not None: return
@@ -732,8 +703,6 @@ class SyncReviewTab(QWidget):
     def _raise_overlays(self): pass
 
     def _toggle_play(self):
-        # Use get_state() — is_playing() returns False during VLC's brief
-        # opening phase on first play, causing the click to appear ignored.
         active = [p for p in self.media_players if p]
         any_playing = any(p.get_state() == vlc.State.Playing for p in active)
         if any_playing:
@@ -769,7 +738,6 @@ class SyncReviewTab(QWidget):
         for i, p in enumerate(self.media_players):
             if p:
                 t = p.get_time()
-                if t < 0: continue
                 my_seek = seek_targets[i] if seek_targets and i < len(seek_targets) else 0
                 global_t = _clamp_ms(t - my_seek + max_seek)
                 self.time_slider.blockSignals(True); self.time_slider.setValue(global_t); self.time_slider.blockSignals(False)
@@ -828,7 +796,8 @@ class SyncReviewTab(QWidget):
             p = self.media_players[i] if i < len(self.media_players) else None
             if p and path:
                 _pinst = getattr(p, '_vlc_instance_ref', None)
-                media = (_pinst.media_new if _pinst else vlc.Media)(Path(path).as_uri()); p.set_media(media); p.play()
+                media = (_pinst.media_new if _pinst else vlc.Media)(Path(path).as_uri())
+                p.set_media(media); p.play()
 
         _poll_count = [0]
         def _wait_and_seek():
@@ -1202,4 +1171,13 @@ if __name__ == "__main__":
         window = BrainBattleApp(); window.show()
     except Exception:
         _tb.print_exc(); input("\nPress Enter to exit..."); sys.exit(1)
+    def _cleanup():
+        # Stop EEG streams before Qt tears down widgets — prevents
+        # "QThread destroyed while still running" crash on exit.
+        try:
+            window.live_tab.eeg_widget_1.stop_stream()
+            window.live_tab.eeg_widget_2.stop_stream()
+        except Exception:
+            pass
+    app.aboutToQuit.connect(_cleanup)
     sys.exit(app.exec())

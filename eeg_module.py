@@ -158,8 +158,6 @@ class _MuseScanThread(QThread):
                         seen.add(name)
                         devices.append({"name": name, "address": addr})
             self.found.emit(devices)
-            if not devices:
-                print(f"[muselsl scan] No devices parsed. Raw output:\n{combined[:500]}")
         except subprocess.TimeoutExpired:
             self.error.emit("Scan timed out after 20s.")
         except Exception as exc:
@@ -169,8 +167,9 @@ class _MuseScanThread(QThread):
 # ─── LSL reader thread ────────────────────────────────────────────────────────
 
 class _LSLReaderThread(QThread):
-    samples = pyqtSignal(object, object)
-    error   = pyqtSignal(str)
+    samples   = pyqtSignal(object, object)
+    error     = pyqtSignal(str)
+    connected = pyqtSignal()   # emitted on first chunk — confirms BLE+LSL working
 
     def __init__(self, stream_name: str = "", parent=None):
         super().__init__(parent)
@@ -185,61 +184,66 @@ class _LSLReaderThread(QThread):
             return
 
         self._running = True
-        inlet = None
-        try:
-            streams = pylsl.resolve_byprop("type", "EEG", timeout=10.0)
-            if not streams:
-                self.error.emit("No EEG LSL stream found. Is muselsl running?")
-                return
-            chosen = streams[0]
-            if self.stream_name:
-                for s in streams:
-                    if self.stream_name.lower() in s.name().lower():
-                        chosen = s
+
+        while self._running:
+            inlet = None
+            try:
+                # Resolve with short timeout so we retry quickly
+                streams = pylsl.resolve_byprop("type", "EEG", timeout=1.0)
+                if not streams:
+                    import time; time.sleep(0.5)
+                    continue
+
+                chosen = streams[0]
+                if self.stream_name:
+                    for s in streams:
+                        if self.stream_name.lower() in s.name().lower():
+                            chosen = s; break
+
+                # recover=True: pylsl automatically reconnects on transmission
+                # errors instead of raising LostError — transparent to our code.
+                # max_buflen=360: 360s buffer survives extended reconnect attempts.
+                inlet = pylsl.StreamInlet(
+                    chosen, max_buflen=360, recover=True
+                )
+                inlet.open_stream()
+
+                consecutive_empty = 0
+                received_first_chunk = False
+
+                while self._running:
+                    try:
+                        chunk, ts = inlet.pull_chunk(timeout=0.1, max_samples=12)
+                    except Exception:
+                        # Any inlet error — break inner loop and re-resolve
                         break
-            inlet = pylsl.StreamInlet(chosen, max_buflen=30)
-            inlet.open_stream()
 
-            consecutive_empty = 0
-            while self._running:
-                try:
-                    chunk, ts = inlet.pull_chunk(timeout=0.1, max_samples=12)
-                except pylsl.LostError:
-                    self.error.emit(
-                        f"Device disconnected — stream lost."
-                    )
-                    return
-                except Exception as e:
-                    self.error.emit(f"Stream error: {e}")
-                    return
-
-                if chunk:
-                    consecutive_empty = 0
-                    self.samples.emit(
-                        np.array(chunk, dtype=np.float32),
-                        np.array(ts, dtype=np.float64),
-                    )
-                else:
-                    consecutive_empty += 1
-                    # ~5 seconds of silence = stream is dead
-                    if consecutive_empty > 50:
-                        self.error.emit(
-                            "No data received for 5s — device may be disconnected."
+                    if chunk:
+                        consecutive_empty = 0
+                        if not received_first_chunk:
+                            received_first_chunk = True
+                            self.connected.emit()
+                        self.samples.emit(
+                            np.array(chunk, dtype=np.float32),
+                            np.array(ts,    dtype=np.float64),
                         )
-                        return
-        except Exception as exc:
+                    else:
+                        pass  # pylsl recover=True handles reconnection
+            except Exception:
+                pass
+            finally:
+                if inlet:
+                    try: inlet.close_stream()
+                    except Exception: pass
+                inlet = None
+
             if self._running:
-                self.error.emit(str(exc))
-        finally:
-            if inlet:
-                try:
-                    inlet.close_stream()
-                except Exception:
-                    pass
+                import time; time.sleep(0.5)
 
     def stop(self):
         self._running = False
-        self.wait(2000)
+        self.quit()
+        self.wait(5000)
 
 
 # ─── Device picker dialog ─────────────────────────────────────────────────────
@@ -613,23 +617,34 @@ class EEGLiveWidget(QFrame):
         cmd = [sys.executable, "-m", "muselsl", "stream"]
         if name:
             cmd += ["-n", name]
+        # Use PIPE not DEVNULL — DEVNULL blocks muselsl's asyncio writes on
+        # macOS after ~30s causing CoreBluetooth to drop the BLE connection.
         self._stream_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-        # Give the stream process 3s to advertise on LSL before connecting inlet
+        self._stream_thread = None
+        # Drain pipes on daemon threads so they never fill and block
+        import threading
+        def _drain(p):
+            try:
+                for _ in p: pass
+            except Exception: pass
+        threading.Thread(target=_drain, args=(self._stream_proc.stdout,), daemon=True).start()
+        threading.Thread(target=_drain, args=(self._stream_proc.stderr,), daemon=True).start()
+        # 3s for muselsl to connect BLE and advertise LSL stream
         QTimer.singleShot(3000, lambda: self._start_inlet(name))
 
     def _start_inlet(self, device_name: str):
         self._reader = _LSLReaderThread(stream_name=device_name, parent=self)
         self._reader.samples.connect(self._on_samples)
         self._reader.error.connect(self._on_stream_error)
+        self._reader.connected.connect(self._on_inlet_connected)
         self._reader.start()
         self._is_streaming = True
         self._t0 = 0.0
-        self._draw_timer.start()
-        self._placeholder.setVisible(False)
-        self._show_view(self._view_mode)
-        self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
+        # Show "connecting..." while BLE + LSL handshake completes
+        self._placeholder.setText("[ CONNECTING... ]")
+        self._placeholder.setVisible(True)
         self._connect_btn.setText("DISCONNECT")
         self._connect_btn.setStyleSheet(
             "background:transparent; border:1px solid #ef4444; color:#ef4444;"
@@ -637,37 +652,30 @@ class EEGLiveWidget(QFrame):
         )
         self._pick_btn.setEnabled(False)
 
+    def _on_inlet_connected(self):
+        """Called when first real EEG chunk arrives — BLE+LSL confirmed working."""
+        self._draw_timer.start()
+        self._placeholder.setVisible(False)
+        self._show_view(self._view_mode)
+        self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
+
     def start_recording(self, save_path: str):
         """
         Begin saving EEG to a named CSV file.
         The muselsl stream must already be running (start_stream called first,
         or CONNECT was clicked). If the stream is not yet up, start it first.
         Recording runs until stop_recording() is called.
-
-        The _pending_record_path guard prevents a second timer-based call from
-        launching a duplicate muselsl record process if start_recording() is
-        called twice before the 4.5 s delay fires.
         """
-        # Already recording or another start is pending — do nothing
-        if (self._record_proc and self._record_proc.poll() is None) or \
-                getattr(self, "_pending_record_path", None) is not None:
-            return
-
         if not self._is_streaming:
+            # Auto-start the stream first, then record after it advertises
             device_name = (
                 self._connected_device["name"] if self._connected_device else ""
             )
-            self._pending_record_path = save_path
             self.start_stream(device_name=device_name)
-            QTimer.singleShot(4500, self._launch_pending_record)
+            # Delay record start to let stream come up (stream has 3s delay + 1s buffer)
+            QTimer.singleShot(4500, lambda: self._launch_record_proc(save_path))
         else:
             self._launch_record_proc(save_path)
-
-    def _launch_pending_record(self):
-        path = getattr(self, "_pending_record_path", None)
-        self._pending_record_path = None
-        if path:
-            self._launch_record_proc(path)
 
     def _launch_record_proc(self, save_path: str):
         """
@@ -721,6 +729,7 @@ class EEGLiveWidget(QFrame):
         if self._stream_proc:
             self._stream_proc.terminate()
             self._stream_proc = None
+        self._stream_thread = None
         self._is_streaming = False
         self._wave_canvas.setVisible(False)
         self._band_canvas.setVisible(False)
@@ -732,6 +741,10 @@ class EEGLiveWidget(QFrame):
             "font-family:'Courier New'; font-size:11px; padding:0 16px;"
         )
         self._pick_btn.setEnabled(True)
+
+    def closeEvent(self, event):
+        self.stop_stream()
+        super().closeEvent(event)
 
     def _toggle_stream(self):
         """CONNECT/DISCONNECT button handler — controls monitoring only."""
@@ -765,9 +778,8 @@ class EEGLiveWidget(QFrame):
         self._draw_timer.stop()
         if self._reader:
             self._reader = None
-        if self._stream_proc:
-            self._stream_proc.terminate()
-            self._stream_proc = None
+        self._stream_proc = None
+        self._stream_thread = None
         self._is_streaming = False
 
         # Show disconnect banner in the plot area
@@ -872,7 +884,7 @@ class EEGReviewWidget(QFrame):
         super().__init__(parent)
         self.channel_id = channel_id
         self.setObjectName("panel")
-        self.setMinimumHeight(330)
+        self.setMinimumHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         self._df:        Optional[pd.DataFrame] = None
@@ -951,7 +963,7 @@ class EEGReviewWidget(QFrame):
     # ── Plot construction ─────────────────────────────────────────────────────
 
     def _build_waveform_plot(self):
-        self._wave_fig = Figure(figsize=(10, 3.2), dpi=90, tight_layout=True)
+        self._wave_fig = Figure(figsize=(10, 2.2), dpi=90, tight_layout=True)
         self._wave_fig.patch.set_facecolor(_BG)
         self._wave_axes: dict[str, plt.Axes] = {}
         for i, ch in enumerate(_CHANNELS):
@@ -973,7 +985,7 @@ class EEGReviewWidget(QFrame):
         self._wave_canvas.setVisible(False)
 
     def _build_bandpower_plot(self):
-        self._band_fig = Figure(figsize=(10, 3.2), dpi=90, tight_layout=True)
+        self._band_fig = Figure(figsize=(10, 2.2), dpi=90, tight_layout=True)
         self._band_fig.patch.set_facecolor(_BG)
         self._band_axes: dict[str, plt.Axes] = {}
         names  = list(_BANDS.keys())
@@ -1007,44 +1019,31 @@ class EEGReviewWidget(QFrame):
 
     def load(self, df: pd.DataFrame, offset_sec: float = 0.0,
              device_name: str = ""):
-        if df is None or df.empty or "timestamps" not in df.columns:
-            print(f"[EEGReviewWidget {self.channel_id}] load() skipped — "
-                  f"DataFrame is None, empty, or missing 'timestamps' column.")
-            return
-        try:
-            self._df = df.copy()
-            self._offset_sec = offset_sec
-            first_ts = float(df["timestamps"].iloc[0])
-            self._df["global_t"] = (df["timestamps"] - first_ts) - offset_sec
-            self._render_waveform()
-            self._render_bandpower_full()
-            self._wave_canvas.draw()
-            self._band_canvas.draw()
-            duration = float(
-                self._df["global_t"].iloc[-1] - self._df["global_t"].iloc[0]
-            )
-            sign = "+" if offset_sec >= 0 else ""
-            self._offset_lbl.setText(f"offset {sign}{offset_sec:.3f}s  ·  {duration:.0f}s")
-            label = device_name or f"MUSE-S {self.channel_id}"
-            boxer = BOXER_LABELS.get(device_name, "")
-            display = f"EEG {self.channel_id}  —  {label}"
-            if boxer:
-                display += f"  [{boxer}]"
-            self._title_lbl.setText(display)
-            self._title_lbl.setStyleSheet(
-                "color: #d4d0c8; font-size: 12px; font-family: 'Courier New';"
-            )
-            self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
-            self._placeholder.setVisible(False)
-            for vl in self._vlines.values():
-                vl.set_visible(True)
-            self._show_view(self._view_mode)
-            print(f"[EEGReviewWidget {self.channel_id}] load() OK — "
-                  f"{len(self._df)} rows, duration={duration:.1f}s")
-        except Exception as _e:
-            import traceback
-            print(f"[EEGReviewWidget {self.channel_id}] load() EXCEPTION: {_e}")
-            traceback.print_exc()
+        self._df = df.copy()
+        self._offset_sec = offset_sec
+        first_ts = float(df["timestamps"].iloc[0])
+        self._df["global_t"] = (df["timestamps"] - first_ts) - offset_sec
+        self._render_waveform()
+        self._render_bandpower_full()
+        duration = float(
+            self._df["global_t"].iloc[-1] - self._df["global_t"].iloc[0]
+        )
+        sign = "+" if offset_sec >= 0 else ""
+        self._offset_lbl.setText(f"offset {sign}{offset_sec:.3f}s  ·  {duration:.0f}s")
+        label = device_name or f"MUSE-S {self.channel_id}"
+        boxer = BOXER_LABELS.get(device_name, "")
+        display = f"EEG {self.channel_id}  —  {label}"
+        if boxer:
+            display += f"  [{boxer}]"
+        self._title_lbl.setText(display)
+        self._title_lbl.setStyleSheet(
+            "color: #d4d0c8; font-size: 12px; font-family: 'Courier New';"
+        )
+        self._status_dot.setStyleSheet("color: #22c55e; font-size: 13px;")
+        self._placeholder.setVisible(False)
+        for vl in self._vlines.values():
+            vl.set_visible(True)
+        self._show_view(self._view_mode)
 
     def set_playhead(self, global_t: float):
         if self._df is None:
